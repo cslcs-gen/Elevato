@@ -2,20 +2,34 @@ import { useState, useRef, useEffect } from "react";
 
 const TABS = ["Assessment", "AI Review", "Writing Coach", "Development Plan"];
 
-const callClaude = async (prompt, systemPrompt = "", maxTokens = 1500) => {
+const callClaude = async (prompt, systemPrompt = "", maxTokens = 1500, timeoutMs = 45000) => {
   const body = {
     model: "claude-sonnet-4-20250514",
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
   };
   if (systemPrompt) body.system = systemPrompt;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  return data.content?.map(b => b.text || "").join("\n") || "No response.";
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`API error ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error.message);
+    return data.content?.map(b => b.text || "").join("\n") || "No response.";
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new Error("TIMEOUT");
+    throw e;
+  }
 };
 
 const RATING_COLORS = {
@@ -26,10 +40,23 @@ const RATING_COLORS = {
   D: { color: "#F87171", bg: "rgba(248,113,113,0.15)", label: "Did Not Meet", sub: "Significant improvement needed" },
 };
 
-const Spinner = ({ text = "AI is thinking..." }) => (
-  <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#4F8EF7", fontSize: 13, padding: "16px 0" }}>
-    <div style={{ width: 18, height: 18, border: "2px solid rgba(79,142,247,0.3)", borderTopColor: "#4F8EF7", borderRadius: "50%", animation: "spin 0.7s linear infinite", flexShrink: 0 }} />
-    {text}
+const Spinner = ({ text = "AI is thinking...", seconds = 0 }) => (
+  <div style={{ padding: "14px 16px", borderRadius: 12, background: "rgba(79,142,247,0.08)", border: "1px solid rgba(79,142,247,0.2)", marginTop: 4 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#4F8EF7", fontSize: 13 }}>
+      <div style={{ width: 18, height: 18, border: "2px solid rgba(79,142,247,0.3)", borderTopColor: "#4F8EF7", borderRadius: "50%", animation: "spin 0.7s linear infinite", flexShrink: 0 }} />
+      <span>{text}</span>
+      {seconds > 0 && <span style={{ marginLeft: "auto", fontSize: 12, color: "#334155", fontVariantNumeric: "tabular-nums" }}>{seconds}s</span>}
+    </div>
+    {seconds > 15 && (
+      <p style={{ fontSize: 11, color: "#475569", marginTop: 8, lineHeight: 1.5 }}>
+        ⏳ This is normal — complex AI requests can take 20–40s. Please wait...
+      </p>
+    )}
+    {seconds > 35 && (
+      <p style={{ fontSize: 11, color: "#F87171", marginTop: 4, lineHeight: 1.5 }}>
+        ⚠️ Taking longer than usual. If it doesn't complete, tap Retry.
+      </p>
+    )}
   </div>
 );
 
@@ -58,8 +85,12 @@ export default function App() {
   const [questions, setQuestions] = useState([]);
   const [answers, setAnswers] = useState({});
   const [loadingQuestions, setLoadingQuestions] = useState(false);
+  const [qTimer, setQTimer] = useState(0);
+  const [assessTimer, setAssessTimer] = useState(0);
   const [assessmentResult, setAssessmentResult] = useState(null);
   const [loadingAssessment, setLoadingAssessment] = useState(false);
+  const [qError, setQError] = useState("");
+  const [assessError, setAssessError] = useState("");
   const [step, setStep] = useState("setup");
 
   // AI Review
@@ -83,11 +114,16 @@ export default function App() {
   const generateQuestions = async () => {
     if (!staffRole.trim()) return;
     setLoadingQuestions(true);
+    setQError("");
     setQuestions([]);
     setAnswers({});
     setAssessmentResult(null);
+    setQTimer(0);
+
+    const interval = setInterval(() => setQTimer(t => t + 1), 1000);
+
     const sys = `You are an expert HR performance management specialist. Generate structured appraisal questionnaires grounded in industry frameworks. Always cite the specific framework each question is based on. Be precise and professional.`;
-    const prompt = `Generate exactly 8 performance appraisal questions for:
+    const prompt = `Generate exactly 5 performance appraisal questions for:
 - Name: ${staffName || "Staff Member"}
 - Role: ${staffRole}
 - Department: ${staffDept || "General"}
@@ -95,41 +131,60 @@ export default function App() {
 
 Requirements:
 1. Questions must be open-ended for the ASSESSOR/MANAGER to answer based on their observations of the staff
-2. Cover: Strategic Impact, KPI Achievement, Collaboration, Innovation, Communication, Leadership, Professional Growth, Overall Contribution
-3. Each question MUST cite an industry reference from: OKRs (Doerr 2018), KPI Institute, STAR Method (Behavioral Interviewing), SHRM Competency Model, Deloitte Performance Framework, McKinsey 9-Box, Balanced Scorecard (Kaplan & Norton 1992), SMART Goals (Doran 1981)
+2. Cover these 5 areas: Strategic Impact, KPI Achievement, Innovation, Leadership, Professional Growth
+3. Each question MUST cite an industry reference from: OKRs (Doerr 2018), KPI Institute, STAR Method, SHRM Competency Model, Balanced Scorecard (Kaplan & Norton 1992)
 
-Respond ONLY in this exact JSON (no extra text, no markdown):
+Respond ONLY in this exact JSON (no extra text, no markdown fences):
 [{"id":1,"category":"Category","question":"Full assessor question","framework":"Framework Name","reference":"Author/Source, Year","hint":"What a strong answer looks like"}]`;
-    const raw = await callClaude(prompt, sys, 2000);
+
     try {
+      const raw = await callClaude(prompt, sys, 1200, 40000);
+      clearInterval(interval);
       const clean = raw.replace(/```json|```/g, "").trim();
       setQuestions(JSON.parse(clean));
       setStep("questions");
-    } catch {
-      setQuestions([{ id: 1, category: "Error", question: "Could not generate questions. Please try again.", framework: "", reference: "", hint: "" }]);
-      setStep("questions");
+    } catch(e) {
+      clearInterval(interval);
+      if (e.message === "TIMEOUT") {
+        setQError("Request timed out. Tap 'Retry' to try again.");
+      } else {
+        setQError("Something went wrong: " + e.message + ". Tap Retry.");
+      }
     }
     setLoadingQuestions(false);
+    setQTimer(0);
   };
 
   const submitAssessment = async () => {
     const answered = Object.values(answers).filter(a => a?.trim()).length;
-    if (answered < 4) return;
+    if (answered < 3) return;
     setLoadingAssessment(true);
+    setAssessError("");
     setAssessmentResult(null);
+    setAssessTimer(0);
+
+    const interval = setInterval(() => setAssessTimer(t => t + 1), 1000);
+
     const sys = `You are a senior HR performance assessment AI. Analyse assessor responses and determine an objective, evidence-based performance rating. Be fair, specific and constructive.`;
-    const qa = questions.map(q => `CATEGORY: ${q.category} [${q.framework} — ${q.reference}]\nQUESTION: ${q.question}\nASSESSOR ANSWER: ${answers[q.id] || "(Not answered)"}`).join("\n---\n");
-    const prompt = `Assess ${staffName || "staff"} (${staffRole}${staffDept ? ", " + staffDept : ""}) for ${appraisalPeriod}.\n\n${qa}\n\nRespond ONLY with this JSON:\n{"overallRating":"A|B|C+|C|D","overallRationale":"2-3 sentences citing evidence","categoryRatings":[{"category":"name","rating":"A|B|C+|C|D","evidence":"specific evidence"}],"strengths":["strength with evidence"],"improvements":["area to improve"],"summary":"2-3 sentence narrative"}\n\nRating scale: A=Outstanding/Exceeds Beyond, B=Exceed Expectations, C+=Meet & Beyond Peers, C=Meet Expectations, D=Did Not Meet`;
-    const raw = await callClaude(prompt, sys, 2000);
+    const qa = questions.map(q => `CATEGORY: ${q.category} [${q.framework}]\nQ: ${q.question}\nA: ${answers[q.id] || "(Not answered)"}`).join("\n---\n");
+    const prompt = `Assess ${staffName || "staff"} (${staffRole}) for ${appraisalPeriod}.\n\n${qa}\n\nRespond ONLY with JSON (no markdown):\n{"overallRating":"A|B|C+|C|D","overallRationale":"2 sentences with evidence","categoryRatings":[{"category":"name","rating":"A|B|C+|C|D","evidence":"evidence"}],"strengths":["strength"],"improvements":["area"],"summary":"2 sentence narrative"}\n\nA=Outstanding, B=Exceed Expectations, C+=Meet & Beyond Peers, C=Meet Expectations, D=Did Not Meet`;
+
     try {
+      const raw = await callClaude(prompt, sys, 1200, 40000);
+      clearInterval(interval);
       const clean = raw.replace(/```json|```/g, "").trim();
       setAssessmentResult(JSON.parse(clean));
       setStep("result");
-    } catch {
-      setAssessmentResult({ overallRating: "C", overallRationale: "Parse error — please retry.", categoryRatings: [], strengths: [], improvements: [], summary: raw.slice(0, 300) });
-      setStep("result");
+    } catch(e) {
+      clearInterval(interval);
+      if (e.message === "TIMEOUT") {
+        setAssessError("Request timed out. Tap Retry to try again.");
+      } else {
+        setAssessError("Something went wrong. Tap Retry.");
+      }
     }
     setLoadingAssessment(false);
+    setAssessTimer(0);
   };
 
   const runAiReview = async () => {
@@ -250,7 +305,13 @@ Respond ONLY in this exact JSON (no extra text, no markdown):
                 <button onClick={generateQuestions} disabled={!staffRole.trim() || loadingQuestions} style={{ ...S.btn, width: "100%", padding: 14, fontSize: 14, opacity: (!staffRole.trim() || loadingQuestions) ? 0.5 : 1 }}>
                   {loadingQuestions ? "Generating Questions..." : "✨ Generate AI Questions"}
                 </button>
-                {loadingQuestions && <Spinner text="AI is crafting industry-standard questions for this role..." />}
+                {loadingQuestions && <Spinner text="Generating questions..." seconds={qTimer} />}
+                {qError && (
+                  <div style={{ padding: "12px 14px", borderRadius: 10, background: "rgba(248,113,113,0.12)", border: "1px solid rgba(248,113,113,0.25)", fontSize: 13, color: "#F87171" }}>
+                    ⚠️ {qError}
+                    <button onClick={generateQuestions} style={{ display: "block", marginTop: 10, background: "rgba(248,113,113,0.2)", border: "1px solid rgba(248,113,113,0.4)", color: "#F87171", borderRadius: 8, padding: "8px 14px", fontSize: 12, fontWeight: 600, cursor: "pointer", width: "100%" }}>↺ Retry</button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -280,11 +341,17 @@ Respond ONLY in this exact JSON (no extra text, no markdown):
 
                 <div style={{ display: "flex", gap: 10 }}>
                   <button onClick={() => setStep("setup")} style={{ ...S.btnSec, flex: 1 }}>← Back</button>
-                  <button onClick={submitAssessment} disabled={answeredCount < 4 || loadingAssessment} style={{ ...S.btn, flex: 2, opacity: (answeredCount < 4 || loadingAssessment) ? 0.5 : 1 }}>
+                  <button onClick={submitAssessment} disabled={answeredCount < 3 || loadingAssessment} style={{ ...S.btn, flex: 2, opacity: (answeredCount < 3 || loadingAssessment) ? 0.5 : 1 }}>
                     {loadingAssessment ? "Assessing..." : "🤖 Get AI Rating"}
                   </button>
                 </div>
-                {loadingAssessment && <Spinner text="AI is analysing responses and determining the rating..." />}
+                {loadingAssessment && <Spinner text="Analysing responses..." seconds={assessTimer} />}
+                {assessError && (
+                  <div style={{ padding: "12px 14px", borderRadius: 10, background: "rgba(248,113,113,0.12)", border: "1px solid rgba(248,113,113,0.25)", fontSize: 13, color: "#F87171" }}>
+                    ⚠️ {assessError}
+                    <button onClick={submitAssessment} style={{ display: "block", marginTop: 10, background: "rgba(248,113,113,0.2)", border: "1px solid rgba(248,113,113,0.4)", color: "#F87171", borderRadius: 8, padding: "8px 14px", fontSize: 12, fontWeight: 600, cursor: "pointer", width: "100%" }}>↺ Retry</button>
+                  </div>
+                )}
               </div>
             )}
 
